@@ -136,7 +136,8 @@ messages."
   :type '(choice (const :tag "OpenAI" openai)
                  (const :tag "Azure-OpenAI" azure-openai)
                  (const :tag "perplexity.ai" perplexity.ai)
-                 (const :tag "anthropic" anthropic))
+                 (const :tag "anthropic" anthropic)
+                 (const :tag "cohere" cohere))
   :group 'org-ai)
 
 (defvar org-ai-openai-chat-endpoint "https://api.openai.com/v1/chat/completions")
@@ -166,6 +167,11 @@ messages."
   :type 'string
   :group 'org-ai)
 
+(defcustom org-ai-cohere-api-version "2023-06-01"
+  "API version for api.cohere.com."
+  :type 'string
+  :group 'org-ai)
+
 (defun org-ai--openai-get-token (&optional service)
   "Try to get the openai token.
 Either from `org-ai-openai-api-token' or from auth-source."
@@ -186,6 +192,7 @@ Either from `org-ai-openai-api-token' or from auth-source."
                      ('openai "api.openai.com")
                      ('perplexity.ai "api.perplexity.ai")
                      ('anthropic "api.anthropic.com")
+                     ('cohere "api.cohere.com")
                      ('azure-openai (strip-api-url org-ai-azure-openai-api-base)))))
     (or (auth-source-pick-first-password :host endpoint :user "org-ai")
         (auth-source-pick-first-password :host endpoint :login "org-ai"))))
@@ -212,6 +219,8 @@ whether messages are provided."
       "https://api.perplexity.ai/chat/completions")
      ((eq service 'anthropic)
       "https://api.anthropic.com/v1/messages")
+     ((eq service 'cohere)
+      "https://api.cohere.com/v1/messages")
      (t
       (if messages org-ai-openai-chat-endpoint org-ai-openai-completion-endpoint)))))
 
@@ -225,6 +234,9 @@ whether messages are provided."
         ((eq service 'anthropic)
          `(("x-api-key" . ,(org-ai--openai-get-token service))
            ("anthropic-version" . ,org-ai-anthropic-api-version)))
+        ((eq service 'cohere)
+         `(("x-api-key" . ,(org-ai--openai-get-token service))
+           ("cohere-version" . ,org-ai-cohere-api-version)))
         (t
          `(("Authorization" . ,(encode-coding-string (string-join `("Bearer" ,(org-ai--openai-get-token service)) " ") 'utf-8))))))))
 
@@ -369,8 +381,18 @@ from the OpenAI API."
 ;;   (type "content_block_stop" index 0)
 ;;   (type "message_delta" delta (stop_reason "end_turn" stop_sequence nil) usage (output_tokens 22))
 ;;   (type "message_stop"))
+;; and Cohere:
+;; TODO(sness) do this
+;; '((type "message_start" message (id "msg_01HoMq4LgkUpHpkXqXoZ7R1W" type "message" role "assistant" model "claude-3-5-sonnet-20240620" content [] stop_reason nil stop_sequence nil usage (input_tokens 278 output_tokens 2)))
+;;   (type "content_block_start" index 0 content_block (type "text" text ""))
+;;   (type "ping")
+;;   (type "content_block_delta" index 0 delta (type "text_delta" text "Hello Robert"))
+;;   (type "content_block_delta" index 0 delta (type "text_delta" text "."))
+;;   (type "content_block_stop" index 0)
+;;   (type "message_delta" delta (stop_reason "end_turn" stop_sequence nil) usage (output_tokens 22))
+;;   (type "message_stop"))
 (defun org-ai--normalize-response (response)
-  "This function normalizes JSON data received from OpenAI-style and Anthropic endpoints.
+  "This function normalizes JSON data received from OpenAI-style and Anthropic and Cohere endpoints.
 `RESPONSE' is one JSON message of the stream response."
 
   (if-let ((error-message (plist-get response 'error)))
@@ -396,7 +418,25 @@ from the OpenAI API."
           (list (make-org-ai--response :type 'stop :payload stop-reason))))
        ((string= response-type "message_stop") nil)
 
-       ;; not anthropic, try openai
+      ;; not anthropic, try cohere
+      (cond
+       ((string= response-type "ping") nil)
+       ((string= response-type "message_start")
+        (when-let ((role (plist-get (plist-get response 'message) 'role)))
+          (list (make-org-ai--response :type 'role :payload role))))
+       ((string= response-type "content_block_start")
+        (when-let ((text (plist-get (plist-get response 'content_block) 'text)))
+          (list (make-org-ai--response :type 'text :payload text))))
+       ((string= response-type "content_block_delta")
+        (when-let ((text (plist-get (plist-get response 'delta) 'text)))
+          (list (make-org-ai--response :type 'text :payload text))))
+       ((string= response-type "content_block_stop") nil)
+       ((string= response-type "message_delta")
+        (when-let ((stop-reason (plist-get (plist-get response 'delta) 'stop_reason)))
+          (list (make-org-ai--response :type 'stop :payload stop-reason))))
+       ((string= response-type "message_stop") nil)
+       
+       ;; not anthropic or cohere, try openai
        (t (let ((choices (plist-get response 'choices)))
             (cl-loop for choice across choices
                      append (or (when-let ((role (plist-get (plist-get choice 'delta) 'role)))
@@ -590,6 +630,12 @@ is the presence penalty.
         (cl-shiftf messages (cl-subseq messages 1)))
       (setq max-tokens (or max-tokens 4096)))
 
+    (when (eq service 'cohere)
+      (when (string-equal (plist-get (aref messages 0) :role) "system")
+        (setq extra-system-prompt (plist-get (aref messages 0) :content))
+        (cl-shiftf messages (cl-subseq messages 1)))
+      (setq max-tokens (or max-tokens 4096)))
+    
    (let* ((input (if messages `(messages . ,messages) `(prompt . ,prompt)))
           ;; TODO yet unsupported properties: n, stop, logit_bias, user
           (data (map-filter (lambda (x _) x)
